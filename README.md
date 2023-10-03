@@ -1,4 +1,4 @@
-# DAG-Selection-HillClimbingMethod-GaussianBayesianNetwork-Estimation-BodyFat
+# DAG-Selection-Hill Climbing Method-Gaussian Bayesian Network-Estimation-BodyFat
 This paper is based on the example analysis contained in Chapter 8 of Scutari's book on Bayesian Networks "Bayesian Networks with Examples in R" [1]. 
 The author uses a dataset similar to the one chosen for this analysis to:
 
