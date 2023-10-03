@@ -1,0 +1,500 @@
+---
+title: "DAG Selection (Hill Climbing) and GBN Estimation - BodyFat.csv"
+author: "Alessandro Lo Verde"
+date: "10-07-2023"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+    fig_width: 9
+    fig_height: 7
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: inline
+  output: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction. 
+
+This paper is based on the example analysis contained in Chapter 8 of Scutari's book on Bayesian Networks "Bayesian Networks with Examples in R" [1]. The author uses a dataset similar to the one chosen for this analysis to:
+
+- select an optimal DAG (Directed Acyclic Graph) by imposing partial topological ordering;
+
+- make predictions about the obtained GBN (Gaussian Bayesian Network). 
+
+The objective is to estimate the relationships between 9 response variables Y (fat part and lean part of different body parts) and 5 explanatory variables X (age, height, weight, abdominal circumference, BMI).
+
+The main steps followed by the author include:
+
+- Dividing the dataset into training set and test set.
+
+- Fitting a full (saturated) multivariate model including all variables.
+
+- Searching for an "optimal" DAG model using a Score based Greedy (Hill Climbing) search algorithm. Specifically, a topological structure is specified using whitelists (blacklists) with the BNlearn package. It is imposed that variables Y are never parents of variables X. 
+
+- Parameter estimation assuming a multivariate Gaussian distribution for the Bayesian network.
+
+- Graphical representation of the obtained model.
+
+The criterion used for selection by Hill Climbing is the BIC (Bayesian Information Criterion), while the SEP (Standard Error of Prediction), calculated as the square root of the sum of the square of the bias and the square of the standard deviation, is taken into account to evaluate the goodness of the model.
+
+## 1 -- Dataset
+
+The dataset chosen is "BodyFat.csv," which contains anatomical data from a sample of 252 men of different ages. The objective is to estimate two response variables: BodyFat (body fat) and Wkg (weight in kilograms), using 12 explanatory variables, including age, height, and circumferences of different body parts (neck, waist, chest, wrist, biceps, thigh, etc.).
+
+Some clarifications:
+
+- The variable "Density" is excluded from the analysis because it is perfectly correlated with "Body Fat." The percentage of "Body Fat" can be calculated exactly once body density is known, using Siri's (1956) equation.
+
+- Unlike the author, BMI (Body Mass Index) will not be included as an additional variable because we want to estimate weight in kg (Wkg appears in the formula for calculating BMI, so BMI will not be included as an explanatory variable for obvious reasons)
+
+- Two outliers in rows 172 and 182 are excluded from the analysis because they contain outlier (very low) "Body Fat" values.
+
+```{r Dataset, echo=TRUE}
+
+# Set the working directory
+setwd("/Users/alessandroloverde/Desktop/Github/R-DirectedAcyclicGraph-DAG-Selection-HillClimbingMethod-GaussianBayesianNetwork-Estimation-BodyFat")
+
+# Read the CSV file "bodyfat.csv"
+data = read.csv("bodyfat.csv", header = TRUE)
+
+# Remove outliers
+data <- data[-172, ]
+data <- data[-181, ]
+
+# Transform into European units and convert Age to numeric format
+data$Wkg <- round(data$Weight * 0.4535923, 1)
+data$Hcm <- round(data$Height * 2.54, 1)
+data$Age <- as.numeric(data$Age)
+
+# Save the variables of interest as covariates (explanatory variables) and response variables
+co <- c("Age", "Hcm", "Abdomen", "Neck", "Chest", "Hip", "Thigh", "Knee", "Ankle", "Biceps", "Forearm", "Wrist")
+#co <- c("Hcm", "Abdomen", "Thigh", "Wrist")
+vr <- c("BodyFat", "Wkg")
+
+# Create BM, the dataset considered for analysis
+BM <- data[, c(vr, co)]
+round(head(BM), 1)
+
+```
+## 2 -- Split Training and Test Set
+
+In order to evaluate the effectiveness of our model on an independent test dataset, we split the sample into a training set, used to build the model, and a test set, used to calculate bias, standard deviation, and SEP (Standard Error of Prediction), which will provide a measure of the prediction error (performance) of our model.
+
+```{r Split, echo=TRUE}
+
+set.seed(14)
+
+n <- 1:nrow(BM) # Total number of rows in the dataset
+
+# Specify the desired proportion (training:test)
+proportion <- 0.6
+
+# Calculate the number of observations for training and testing
+train_size <- round(length(n) * proportion)
+test_size <- length(n) - train_size
+
+# Create a vector of random indices
+random_indices <- sample(length(n))
+
+# Perform the data split
+ntrain <- n[random_indices[1:train_size]]
+ntest <- n[random_indices[(train_size + 1):(train_size + test_size)]]
+
+dtrain <- BM[ntrain, ] # Create the training dataset with the specified size
+dval <- BM[ntest, ] # Create the test dataset with the specified size
+
+```
+
+
+## 3 -- A full model (Saturated Model) is fit to see how it performs in prediction
+
+As a first attempt, a multivariate regression is run using a full model that includes all explanatory variables.
+
+The full model, known as a saturated model, assumes no conditional independence restrictions. It is based on the assumption that the sample of random vectors $(y_1,...,y_n)$ is drawn from a multivariate normal distribution.
+
+Multivariate regression on all benchmark explanatory variables is useful in assessing the adequacy of the model.
+
+```{r Fit Complete model, echo=TRUE}
+
+# Fit a saturated model to predict both BodyFat and Wkg based on multiple covariates
+saturated <- lm(cbind(BodyFat, Wkg) ~ Age + Hcm + Abdomen + Neck + Chest + Hip + Thigh + Knee + Ankle + Biceps + Forearm + Wrist, data = dtrain)
+
+# Fit a saturated model to predict both BodyFat and Wkg on the validation dataset
+saturated_test <- lm(cbind(BodyFat, Wkg) ~ Age + Hcm + Abdomen + Neck + Chest + Hip + Thigh + Knee + Ankle + Biceps + Forearm + Wrist, data = dval)
+
+# Calculate the degrees of freedom for residuals in the model fitted on the test set
+resid.df <- df.residual(saturated_test)
+
+# Predictions based on the model on the validation dataset
+preds <- predict(saturated, newdata = dval)
+
+# Calculate bias
+bias <- abs(dval[, vr] - preds)
+
+# Calculate the standard deviation of the prediction
+stdev <- sqrt(colSums((dval[, vr] - preds)^2) / resid.df)
+
+# Calculate the Standard Error of Prediction (SEP)
+sep <- sqrt(bias^2 + stdev^2)
+
+# Summary of model performance
+summary <- cbind("|Bias|" = colMeans(bias),
+                 "Sd.Dev" = stdev,
+                 "SEP" = colMeans(sep))
+round(summary, 2)
+round(colSums(summary), 2)
+
+```
+
+```{r Summary Saturated Model, message = FALSE, echo=FALSE, results='hide'}
+#summary(saturated)
+```
+## 4 -- Optimal DAG model search using Greedy Search Algorithm (BIC criterion) by partially imposing the topological structure.
+
+When dealing with uncertainty not only on the parameters but also on the structure of the Bayesian network, two main approaches are available: the score based approach and the constraint based approach.
+
+***Score based approach***
+
+The score based approach is based on finding an optimal set of inpendency structure and parameters that maximizes a score function (score). Specifically, an attempt is made to select the acyclic directed graph pattern(s) (DAG) with the highest a posteriori probability conditional on the available data (P(g|X)).
+
+It is important to note that score-based approaches do not guarantee the optimality of the solution found, but they allow an approximate solution to be obtained in a reasonable time by effectively selecting the DAG pattern based on the available data.
+
+The score of a DAG (score(g,X)) is calculated using Bayes' law; The a posteriori probability of g given X can be written as:
+
+$$P(g|X) = \frac{P(X|g) * P(g)} {P(X)}$$
+
+Score maximization corresponds to maximization of the numerator. 
+
+In the analysis, a uniform prior over the structures is often assumed (P(g)), then an attempt is made to maximize the probability of the data conditional on the DAG (P(X|G)).
+
+A common score used is the Bayesian Information Criterion (BIC):
+
+$$ BIC_{score}(g, x) = - log P (X | \hat{p}, g) + \frac{d}{2} log N $$
+
+where $\hat{p}$ represents the MaxLik estimate of the network parameters and $d$ is the number of parameters used in the model. 
+
+The BIC provides a trade-off between data likelihood and model complexity, preventing overfitting and favoring simpler models.
+
+***Hill Climbing Method.
+
+The Hill Climbing method, specifically the Max-Min Hill-Climbing (MMHC) algorithm presented by Tsamardinos, Brown and Aliferis in 2006 [2], is used for structural learning of Bayesian networks from complete data.
+
+The MMHC algorithm is developed in two phases:
+
+- The first phase, called the Max-Min-Parent-Children (MMPC) algorithm, uses a statistical test of conditional independence to find the probable sets of parents and children for each node in the network; in this phase, the skeleton (skeleton) of the network is learned, i.e., the basic structure of a network, which represents the conditional dependence relationships between variables without specifying the direction of the arcs.
+
+- The second phase is a local "greedy" search applied in the space of Bayesian networks (B-space), but limited to the hypothetical skeleton identified by the first phase. During this search, one starts with an empty graph and selects the addition, removal, or inversion of an arc so that it maximizes (minimizes) the score increment, in this case the Bayesian Information Criterion (BIC). It is important to note that the resulting graph must remain acyclic at each step, and the addition of an arc is allowed only if that arc has been previously identified by MMPC.
+
+The MMHC algorithm is known for its speed and scalability, making it suitable even for large networks. It exhibits good performance compared to other methods such as SHD and BDeu, ensuring good reconstruction quality of networks. However, it is important to consider that there are other methods that may offer superior performance under certain conditions.
+
+
+***Implementation of the HC method***
+
+In the first part via the BNlearn package we set up a topological structure for the model, specifying the restrictions of the arcs by blacklisting and whitelisting.
+
+- Blacklist means a set of links that is imposed as mandatory between two lists of variables.
+
+- Whitelist means a set of links that are forbidden to be made between two lists of variables.
+
+Specifically, due to the nature of the variables Y (response) and X (explanatory) and due to some heuristic attempts made in which recurrent links between the variables were noted, it was decided to set:
+
+- a whitelist for which the variables Wrist and Abdomen always have an arc directed toward the response variable BodyFat;
+
+- a whitelist pr for which the variables Hcm, Chest, Hip, Neck, Thigh always have an arc directed toward the response variable Wkg;
+
+- a whitelist for which Age always has an arc directed toward the response variable Hip;
+
+- a blacklist for which variables Y are never the parents of variables X. 
+
+- A blacklist for which the variables Hcm, Chest, Hip, Neck, Thigh are never the parents of the variable BodyFat. 
+
+In the second part:
+
+- The Hill Climbing algorithm is used to estimate the structure of the DAG model using the BIC criterion.
+
+- The textual representation of the DAG model is printed.
+
+```{r Model selection with HC: Whitelist and Blacklist, echo=TRUE}
+# Topological Sorting: Whitelist and Blacklist
+
+library(bnlearn)
+library(ggm)
+
+# Whitelist Configuration
+# Setting up directed edges from "Wrist" and "Abdomen" to "BodyFat"
+wl1 <- cbind(from = rbind("Wrist", "Abdomen"), to = rep("BodyFat", 2))
+
+# Setting up directed edges from "Hcm", "Neck", "Hip", "Chest", and "Thigh" to "Wkg"
+wl2 <- cbind(from = rbind("Hcm", "Neck", "Hip", "Chest", "Thigh"), to = rep("Wkg", 5))
+
+# Setting up a directed edge from "Age" to "Hip"
+wl3 <- cbind(from = "Age", to = "Hip")
+
+# Blacklist Configuration
+# Setting up a blacklist of all variable pairs from covariates to responses
+bl1 <- cbind(from = rep(vr, 12), to = rep(co, each = 2))
+
+# Setting up a blacklist of directed edges from "Hcm", "Neck", "Hip", "Chest", and "Thigh" to "BodyFat"
+bl2 <- cbind(from = rbind("Hcm", "Neck", "Hip", "Chest", "Thigh"), to = rep("BodyFat", 5))
+
+# Hill Climbing Method
+
+# Searching for the optimal DAG (Directed Acyclic Graph) model
+penalty <- 4
+dag <- hc(dtrain, whitelist = rbind(wl1, wl2, wl3), blacklist = rbind(bl1, bl2), score = "bic-g", k = log(nrow(dtrain))/2 + penalty)
+
+# Calculating the BIC score for the DAG model
+# score(dag, dtrain, type = "bic-g", k = log(nrow(dtrain))/2 + penalty)
+
+# Printing the textual representation of the DAG model
+bnlearn:::fcat(modelstring(dag))
+
+```
+
+## 5 -- Plot del DAG
+
+```{r Plot Selected model, message = FALSE, echo=TRUE}
+
+library(igraph)
+
+# Convert the Bayesian network DAG to an igraph object
+idag2 <- as.igraph(dag)
+
+# Set the Layout
+layout <- layout_with_fr(idag2)
+
+# Define the nodes to separate
+
+nodo1 <- which(V(idag2)$name == "BodyFat")
+nodo2 <- which(V(idag2)$name == "Wkg")
+
+nodo3 <- which(V(idag2)$name == "Age")
+nodo4 <- which(V(idag2)$name == "Hcm")
+
+nodo5 <- which(V(idag2)$name == "Forearm")
+nodo6 <- which(V(idag2)$name == "Wrist")
+nodo7 <- which(V(idag2)$name == "Biceps")
+
+nodo8 <- which(V(idag2)$name == "Abdomen")
+nodo9 <- which(V(idag2)$name == "Knee")
+nodo10 <- which(V(idag2)$name == "Thigh")
+
+nodo11 <- which(V(idag2)$name == "Neck")
+nodo12 <- which(V(idag2)$name == "Chest")
+nodo13 <- which(V(idag2)$name == "Hip")
+nodo14 <- which(V(idag2)$name == "Ankle")
+
+# Modify the coordinates of nodes in the layout to separate them
+
+layout[nodo1, ] <- c(-2, -2.5)
+layout[nodo2, ] <- c(2, -2.5)
+
+layout[nodo3, ] <- c(-2, 2.5)
+layout[nodo4, ] <- c(2, 2.5)
+
+layout[nodo5, ] <- c(-3.5, 1.5)
+layout[nodo6, ] <- c(-3, -0.5)
+layout[nodo7, ] <- c(-2.5, 0.5)
+
+layout[nodo8, ] <- c(1.5, -1.5)
+layout[nodo9, ] <- c(-1.5, -1.5)
+layout[nodo10, ] <- c(-1, 1)
+
+layout[nodo11, ] <- c(2.5, 0.5)
+layout[nodo12, ] <- c(3, -0.5)
+layout[nodo13, ] <- c(1, 1)
+layout[nodo14, ] <- c(0.5, 0)
+
+colori <- rep("lightblue", vcount(idag2))
+
+# Set the color to green for the "BodyFat" node
+colori[nodo1] <- "green"
+
+# Set the color to green for the "Wkg" node
+colori[nodo2] <- "green"
+
+# Plot the DAG with Whitelists and Blacklists
+plot(idag2, main = "DAG with Whitelists and Blacklists",
+     edge.color = "black", layout = layout, vertex.color = colori)
+
+```
+
+## 6 -- Fitting the GBN on the training set and estimating its multivariate normal distribution. 
+
+The network that was found is based on certain assumptions that characterize GBNs:
+
+- Each node follows a normal distribution.
+
+- Nodes without parents (root nodes) are described by their respective univariate normal mariginals.
+
+- The conditioning effect of parent nodes is given by an additive linear term in the mean, and does not affect the variance. In other words, each node has a variance that is specific to that node and does not depend on the value of the parents.
+
+- The local distribution of each node can be expressed as a classical Gaussian linear regression model that must include an intercept and in the node under consideration is the response variable of the model and the parent nodes are the explanatory variables, without the addition of any interaction term.
+
+Precisely because of the latter assumption we can estimate all the local distributions (parameters) of the various nodes by performing a linear regression with bn.fit.
+
+Following this assumption it is in fact possible to estimate all the parameters of the various regressions simply by knowing the S matrix of covariance of the data and the associated DAG graph describing their independence structure.
+We fit the various linear regressions by conditioning by virtue of the independence structure determined by the DAG. We thus obtain the fictitious parameters of our Gaussian Bayesian Network.
+
+It can be shown that if the properties assumed above hold for the local distributions of the various nodes, then the joint distribution of all nodes is a multivariate normal that can be obtained from the product of the local distributions with independence structure defined by the DAG (factoring). 
+
+In the second section we will therefore turn to the estimation of the marginal expected values $\mu$, the marginal standard deviations and the correlation matrix $\Gamma$ (gamma) of the multivariate normal distribution obtained from the DAG. 
+
+We need to use the following functions bnfit2nbn, nbn2gema and gema2mn:
+
+- bnfit2nbn(bn): This function converts a bn (Bayesian Network) object estimated with the bn.fit method of the bnlearn library to an nbn (Naive Bayesian Network) object. The nbn is a representation of the Bayesian Gaussian network (GBN) model, in which it is defined through its local distributions.
+
+- nbn2gema(nbn): This function converts the nbn (Naive Bayesian Network) object to a gema (Gaussian Estimation of Marginal Averages) object. The function computes the vector $\mu$ of expected marginal values and the matrix $li$ such that if the vector E is a vector of centered and standardized normal i.i.d., then $\mu + li * E$ has the same distribution as the input nbn.
+
+- gema2mn(gema): This function converts the gema (Gaussian Estimation of Marginal Averages) object to an mn (Multivariate Normal distribution) object. The mn represents the multivariate Gaussian distribution estimated from the gema object containing the $\mu$ vector and the $li$ matrix. As the mn object, the GBN is now described by a vector of expected values $\mu$, a vector of marginal standard deviations and a matrix of correlations $\Gamma$ (gamma).
+
+```{r Fitting DAG, echo=TRUE}
+
+# Load the "rbmn" library
+library(rbmn) 
+
+# Estimate local distributions of the GBN
+bn <- bn.fit(dag, data = dval, method = "mle-g") # Fit the model to the DAG
+
+# Estimated marginal local distributions using MaxLik
+bn$Wkg
+bn$BodyFat
+
+# Empirical approximation of the Kullback-Leibler distance between the learned BN and the unobservable "true" BN (lower values are better)
+bn.cv(BM, bn = "hc", method = "k-fold", k = 10, runs = 10)
+
+# Estimate parameters of the multivariate Gaussian distribution
+
+# nbn object: GBN described as its local distributions
+gbn.rbmn <- bnfit2nbn(bn)
+# print8nbn(gbn.rbmn)
+
+# gema object: GBN described by two matrices (a vector of expected values and a matrix to multiply white noise N(0,1))
+gema.rbmn <- nbn2gema(gbn.rbmn)
+# print8gema(gema.rbmn)
+
+# mn object: GBN described by a vector of expected values (mu) and a covariance matrix (gamma)
+mvnorm.dist <- gema2mn(gema.rbmn) 
+# print8mn(mvnorm.dist)
+ 
+# Inverse correlation matrix to observe conditional independencies
+inverse_correlation_matrix <- round(solve(mvnorm.dist$gamma), 2)
+
+# Threshold for transforming into an adjacency matrix
+threshold <- 0.0001
+
+# Apply the threshold and convert the values
+adjacency_matrix <- ifelse(inverse_correlation_matrix > threshold, 1, 0)
+print(adjacency_matrix)
+  
+```
+
+## 7 -- Exact inference: estimation of conditional expected values of the response variables on the test set and calculation of bias, st. dev and SEP 
+
+For each row of the test set data (dval), using the condi4joint function contained in the rbmn package, the estimates of $\mu$ conditional expected value and $\Sigma$ conditional variance covariance matrix of the response variables BodyFat and Wkg of the joint conditional distribution are calculated; the inputs to this function are:
+
+- the numerical value of each observation contained in the test set of nodes corresponding to the explanatory variables.
+
+- the mn (Multivariate Normal) object defined in the previous section containing the vector of marginal expected values $\mu$ and the matrix of marginal correlations $\Gamma$ (gamma) of the multivariate normal distribution estimated on the training set.
+
+In the last section, we evaluate the performance of the Bayesian network model by comparing the observed values with the conditional expected values calculated on each observation with condi4joint, calculating the vector of bias, st.dev. and SEP on the test set:
+
+- Bias values are calculated by subtracting the expected values obtained from the conditional distribution from the actual values of the response variables (BodyFat and Wkg).
+
+- Standard deviations are calculated using the square root of the variances obtained from estimating the joint conditional distribution (main diagonal of $\Sigma$).
+
+- The standard error of prediction (SEP) for each variable of interest is calculated by combining the bias and standard deviation values using the following formula sqrt(bias^2 + stdev^2).
+
+```{r Conditioned Distribution, echo=TRUE}
+
+# Initialization of vectors
+sep <- mu_condizioned <- bias <- stdev <- dval[, vr]
+
+for (i in seq(nrow(dval))) {
+
+  # Calculate the conditional distribution given the values of covariates for each row
+  mvnorm.cond <- condi4joint(mvnorm.dist, par = vr, pour = co,
+                            unlist(dval[i, co])) 
+
+  # Save conditional mu values
+  mu_condizioned[i, vr] <- mvnorm.cond$mu[vr]
+
+  # Calculate bias for the variables of interest
+  bias[i, vr] <- dval[i, vr] - mvnorm.cond$mu[vr]
+
+  # Calculate standard deviation for the variables of interest
+  stdev[i, vr] <- sqrt(diag(mvnorm.cond$gamma)[vr])
+
+  # Calculate Standard Error of Prediction (SEP)
+  sep[i, vr] <- sqrt(stdev[i, vr]^2 + bias[i, vr]^2)
+}
+
+# Parameter estimation on the test set
+
+# Calculate evaluation scores with blacklist
+gscores_bn3 <- cbind("|Bias|" = colMeans(abs(bias)),
+                 "Sd.Dev" = colMeans(stdev),
+                 "SEP" = colMeans(sep))
+round(gscores_bn3, 2) # Evaluation scores for each variable
+round(colSums(gscores_bn3), 2) # Sum of evaluation scores for all variables
+
+```
+
+```{r Prediction Example with BN, message = FALSE, echo=FALSE, results='hide'}
+
+# Prediction on the GBN associated with the selected DAG using HC
+
+# Example of real person's data
+new_data <- data.frame(Age = 28, Hcm = 186,  Abdomen = 105, Neck = 42, Chest = 113, Hip = 103,  Thigh = 62, Knee = 43 , Ankle=25, Biceps =34, Forearm = 30, Wrist = 20)
+
+# Initialization of vectors
+mu_condizioned <- dval[, vr] 
+
+# Calculate the conditional distribution 
+mvnorm.cond_n <- condi4joint(mvnorm.dist, par = vr, pour = co, unlist(new_data[1, co])) 
+  
+# Save the conditional mean
+mu_condizioned[1, vr] <- mvnorm.cond_n$mu[vr]
+
+# Display the predictions
+mu_condizioned[1, vr]
+
+```
+
+```{r Model goodness summary table, message = FALSE, echo=FALSE, results='hide'}
+
+# Create a data frame for BodyFat (BF) predictions and metrics
+tabella.bf <- data.frame(
+  "Valore Reale BF" = round(dval[, vr[1]], 2),             # Real BodyFat values in the test set
+  "Mu Condizionato BF" = round(mu_condizioned[, vr[1]], 2),  # Predicted conditional means for BodyFat
+  "Bias BF" = round(bias[, vr[1]], 2),                    # Bias for BodyFat predictions
+  "St dev BF" = round(stdev[, vr[1]], 2),                # Standard deviation for BodyFat predictions
+  "SEP BF" = round(sep[, vr[1]], 2))                      # Standard Error of Prediction (SEP) for BodyFat
+
+# Display the first 10 rows of the BodyFat data frame
+tabella.bf[1:10,]
+
+# Create a data frame for Wkg predictions and metrics
+tabella.Wkg <- data.frame(
+  "Valore Reale Wkg" = round(dval[, vr[2]], 2),                  # Real Wkg values in the test set
+  "Mu Condizionato Base Wkg" = round(mu_condizioned[, vr[2]], 2), # Predicted conditional means for Wkg
+  "Bias Wkg" = round(bias[, vr[2]], 2),                        # Bias for Wkg predictions
+  "St Dev Wkg" = round(stdev[, vr[2]], 2),                    # Standard deviation for Wkg predictions
+  "SEP Wkg" = round(sep[, vr[2]], 2))                          # Standard Error of Prediction (SEP) for Wkg
+
+# Display the first 10 rows of the Wkg data frame
+tabella.Wkg[1:10,]
+
+```
+  
+## Bibliography
+
+1. M. Scutari and J.-B. Denis, Bayesian Networks with Examples in R. Chapman & Hall, 2nd edition. 2021
+
+2. I. Tsamardinos, L. E. Brown, and C. F. Aliferis. The max min hill climbing bayesian network structure learning algorithm. Machine Learning, (65):31–78, 2006.
