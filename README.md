@@ -22,6 +22,6 @@ The main steps followed by the author include:
 
 The criterion used for selection by Hill Climbing is the BIC (Bayesian Information Criterion), while the SEP (Standard Error of Prediction), calculated as the square root of the sum of the square of the bias and the square of the standard deviation, is taken into account to evaluate the goodness of the model.
 
-** Dataset **
+# Dataset
 
 The dataset chosen is "BodyFat.csv," which contains anatomical data from a sample of 252 men of different ages. The objective is to estimate two response variables: BodyFat (body fat) and Wkg (weight in kilograms), using 12 explanatory variables, including age, height, and circumferences of different body parts (neck, waist, chest, wrist, biceps, thigh, etc.).
